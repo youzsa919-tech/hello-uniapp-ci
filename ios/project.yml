@@ -1,0 +1,46 @@
+# xcodegen 项目描述文件
+# macOS runner 上运行: brew install xcodegen && xcodegen generate
+
+name: HelloApp
+options:
+  bundleIdPrefix: com.hello.uniapp
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.0"
+
+settings:
+  base:
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    ENABLE_BITCODE: "NO"
+
+targets:
+  HelloApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: HelloApp
+        excludes:
+          - "www/**"
+    resources:
+      - path: HelloApp/www
+        type: folder
+    settings:
+      base:
+        INFOPLIST_FILE: HelloApp/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.hello.uniapp
+        PRODUCT_NAME: HelloApp
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+    preBuildScripts:
+      - name: "Copy UniApp Resources"
+        script: |
+          # uni-app 资源由 CI 工作流在上层目录构建
+          # 构建产物: dist/build/app/www/
+          if [ -d "../../dist/build/app/www" ]; then
+            mkdir -p "${SRCROOT}/HelloApp/www"
+            cp -r "../../dist/build/app/www/"* "${SRCROOT}/HelloApp/www/"
+            echo "Copied uni-app resources to app bundle"
+          fi

@@ -269,121 +269,67 @@ jobs:
       - name: 构建 uni-app (app-plus 平台)
         run: npm run build:app
 
-      - name: 上传 uni-app 资源包
-        uses: actions/upload-artifact@v4
-        with:
-          name: uniapp-resources-ios
-          path: dist/build/app/
-          retention-days: 7
-
-      # iOS IPA 打包 (最小 WebView 壳)
-      - name: 创建 iOS 壳工程
+      # ---------- 复制资源到 iOS 项目 ----------
+      - name: 复制 uni-app 资源到 iOS 项目
         run: |
-          mkdir -p HelloApp/HelloApp
-          mkdir -p HelloApp/HelloApp/Resources
-
-          # 复制 uni-app 资源
+          mkdir -p ios/HelloApp/www
           if [ -d "dist/build/app/www" ]; then
-            cp -r dist/build/app/www/* HelloApp/HelloApp/Resources/
+            cp -r dist/build/app/www/* ios/HelloApp/www/
           else
-            cp -r dist/build/app/* HelloApp/HelloApp/Resources/
+            cp -r dist/build/app/* ios/HelloApp/www/
           fi
+          echo "=== iOS 资源目录 ==="
+          find ios/HelloApp/www -maxdepth 2 -type f | head -20
 
-          # Info.plist
-          cat > HelloApp/HelloApp/Info.plist << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleDevelopmentRegion</key><string>en</string>
-              <key>CFBundleExecutable</key><string>HelloApp</string>
-              <key>CFBundleIdentifier</key><string>com.hello.uniapp</string>
-              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-              <key>CFBundleName</key><string>Hello UniApp</string>
-              <key>CFBundlePackageType</key><string>APPL</string>
-              <key>CFBundleShortVersionString</key><string>1.0</string>
-              <key>CFBundleVersion</key><string>1</string>
-              <key>LSRequiresIPhoneOS</key><true/>
-              <key>UILaunchStoryboardName</key><string>LaunchScreen</string>
-              <key>UIRequiredDeviceCapabilities</key><array><string>armv7</string></array>
-              <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
-              <key>NSAppTransportSecurity</key>
-              <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
-          </dict>
-          </plist>
-          EOF
+      # ---------- 生成 Xcode 项目并编译 ----------
+      - name: 安装 xcodegen 并生成 Xcode 项目
+        run: |
+          brew install xcodegen
+          cd ios
+          xcodegen generate
+          echo "=== Xcode 项目已生成 ==="
+          ls -la *.xcodeproj/
 
-          # main.swift
-          cat > HelloApp/HelloApp/main.swift << 'EOF'
-          import UIKit
-          import WebKit
-
-          class AppDelegate: UIResponder, UIApplicationDelegate {
-              var window: UIWindow?
-              func application(_ application: UIApplication,
-                  didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-                  window = UIWindow(frame: UIScreen.main.bounds)
-                  let vc = ViewController()
-                  window?.rootViewController = vc
-                  window?.makeKeyAndVisible()
-                  return true
-              }
-          }
-
-          class ViewController: UIViewController, WKNavigationDelegate {
-              var webView: WKWebView!
-              override func viewDidLoad() {
-                  super.viewDidLoad()
-                  let config = WKWebViewConfiguration()
-                  config.preferences.javaScriptEnabled = true
-                  webView = WKWebView(frame: view.bounds, configuration: config)
-                  webView.navigationDelegate = self
-                  webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-                  view.addSubview(webView)
-                  if let path = Bundle.main.path(forResource: "index", ofType: "html", inDirectory: "Resources") {
-                      webView.loadFileURL(URL(fileURLWithPath: path),
-                          allowingReadAccessTo: URL(fileURLWithPath: Bundle.main.resourcePath!))
-                  }
-              }
-          }
-
-          UIApplicationMain(CommandLine.argc, CommandLine.unsafeArgv, nil,
-              NSStringFromClass(AppDelegate.self))
-          EOF
-
-          # Build with xcodebuild (unsigned)
-          cd HelloApp
-          xcodebuild -create-xcproject
+      - name: 编译 iOS (无签名, arm64 真机架构)
+        run: |
+          cd ios
           xcodebuild \
             -project HelloApp.xcodeproj \
             -scheme HelloApp \
             -configuration Release \
-            -sdk iphonesimulator \
+            -sdk iphoneos \
+            -arch arm64 \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            -derivedDataPath build 2>&1 || echo "Simulator build completed"
+            ONLY_ACTIVE_ARCH=NO \
+            -derivedDataPath build \
+            2>&1 | tee xcodebuild.log
 
-          # Find .app and package as IPA
-          APP_PATH=$(find build -name "*.app" -type d | head -1)
-          if [ -n "$APP_PATH" ]; then
-            mkdir -p Payload
-            cp -r "$APP_PATH" Payload/
-            zip -r app-unsigned.ipa Payload/
-            echo "IPA created: app-unsigned.ipa"
-            ls -lh app-unsigned.ipa
-          else
-            echo "No .app found, creating placeholder"
-            touch app-unsigned.txt
+      - name: 打包 IPA
+        run: |
+          APP_PATH=$(find ios/build -name "*.app" -type d | head -1)
+          echo "App 路径: $APP_PATH"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "!!! 未找到 .app, 检查编译日志"
+            grep -i "error:\|BUILD FAILED" ios/xcodebuild.log || true
+            exit 1
           fi
+
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r app-unsigned.ipa Payload/
+          rm -rf Payload
+          echo "=== IPA 生成成功 ==="
+          ls -lh app-unsigned.ipa
 
       - name: 上传 IPA 产物
         uses: actions/upload-artifact@v4
         with:
           name: app-unsigned-ios
-          path: HelloApp/app-unsigned.ipa
+          path: app-unsigned.ipa
           retention-days: 30
-        continue-on-error: true
 
 
   # ============================
