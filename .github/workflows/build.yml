@@ -1,0 +1,380 @@
+name: Build APK & IPA
+
+# 触发条件: 推送代码到 main/master 分支, 或手动触发
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      appid:
+        description: 'DCloud AppID (默认使用 manifest.json 中的 __UNI__HelloUniApp)'
+        required: false
+        default: '__UNI__HelloUniApp'
+      version_name:
+        description: '版本名称'
+        required: false
+        default: '1.0.0'
+      version_code:
+        description: '版本号 (整数)'
+        required: false
+        default: '100'
+
+# 环境变量 (全局)
+env:
+  APPID: ${{ github.event.inputs.appid || '__UNI__HelloUniApp' }}
+  VERSION_NAME: ${{ github.event.inputs.version_name || '1.0.0' }}
+  VERSION_CODE: ${{ github.event.inputs.version_code || '100' }}
+  # uni-app 离线 SDK 版本 (与 uni-app runtime 版本对应)
+  SDK_VERSION: '4.36.97223'
+  # Android
+  ANDROID_SDK_URL: 'https://native-res.dcloud.net.cn/uni-app/download/sdk/Android-SDK@4.36.97223.zip'
+  # iOS
+  IOS_SDK_URL: 'https://native-res.dcloud.net.cn/uni-app/download/sdk/iOS-SDK@4.36.97223.zip'
+
+jobs:
+
+  # ============================
+  # Job 1: 构建 Android APK
+  # ============================
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+
+      # ---------- Node.js & uni-app 构建 ----------
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 缓存 npm 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: 安装项目依赖
+        run: npm install --legacy-peer-deps
+
+      - name: 构建 uni-app (app-plus 平台)
+        run: npm run build:app
+
+      - name: 展示构建产物
+        run: |
+          echo "=== uni-app 构建产物目录 ==="
+          find dist/build/app -type f | head -50
+
+      # ---------- JDK & Android SDK ----------
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0 platforms;android-33 build-tools;33.0.2'
+
+      # ---------- 下载 Android 离线 SDK ----------
+      - name: 缓存 Android 离线 SDK
+        id: cache-android-sdk
+        uses: actions/cache@v4
+        with:
+          path: android-sdk
+          key: android-offline-sdk-${{ env.SDK_VERSION }}
+
+      - name: 下载 Android 离线 SDK
+        if: steps.cache-android-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p android-sdk
+          curl -L -o android-sdk.zip "${{ env.ANDROID_SDK_URL }}"
+          unzip -q android-sdk.zip -d android-sdk
+          rm android-sdk.zip
+          echo "SDK 目录结构:"
+          find android-sdk -maxdepth 2 -type d
+
+      # ---------- 集成资源到 SDK ----------
+      - name: 复制 uni-app 资源到 Android SDK
+        run: |
+          APPID="${{ env.APPID }}"
+
+          # Android SDK 中的资源目录
+          ASSETS_DIR="android-sdk/SDK/assets/apps/$APPID/www"
+
+          # 创建目录
+          mkdir -p "$ASSETS_DIR"
+
+          # 复制构建产物
+          echo "复制 dist/build/app/ → $ASSETS_DIR"
+          cp -r dist/build/app/* "$ASSETS_DIR/" 2>/dev/null || true
+
+          # 或者 uni-app 构建产物在 dist/build/app 下 www 子目录
+          if [ -d "dist/build/app/www" ]; then
+            echo "检测到 www 子目录, 直接复制 www 内容"
+            rm -rf "$ASSETS_DIR"
+            cp -r dist/build/app/www "$ASSETS_DIR"
+          fi
+
+          echo "=== SDK assets 目录内容 ==="
+          find "android-sdk/SDK/assets/apps/$APPID" -maxdepth 3 -type d
+
+      - name: 配置 Android 包名和版本
+        run: |
+          APPID="${{ env.APPID }}"
+
+          # 更新 dcloud_control.xml (如果存在)
+          DC_XML="android-sdk/SDK/assets/data/dcloud_control.xml"
+          if [ -f "$DC_XML" ]; then
+            echo "更新 dcloud_control.xml"
+            cat "$DC_XML"
+          fi
+
+          # 创建 / 更新 dcloud_control.xml
+          mkdir -p android-sdk/SDK/assets/data
+          cat > "$DC_XML" << 'DCEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <apps>
+            <app appid="APPID_PLACEHOLDER" appver="${{ env.VERSION_NAME }}"/>
+          </apps>
+          DCEOF
+          sed -i "s/APPID_PLACEHOLDER/$APPID/g" "$DC_XML"
+
+          echo "=== dcloud_control.xml ==="
+          cat "$DC_XML"
+
+      # ---------- Gradle 编译 APK ----------
+      - name: 赋予 Gradle 执行权限
+        run: chmod +x android-sdk/SDK/gradlew
+
+      - name: 编译 Android APK
+        working-directory: android-sdk/SDK
+        run: |
+          # 配置 local.properties
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          # Debug 构建 (用 debug 签名, 后续可替换为 release + 正式 keystore)
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: 查找 APK 文件
+        id: find-apk
+        run: |
+          APK_PATH=$(find android-sdk -name "*.apk" -type f | head -1)
+          echo "APK 路径: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+          ls -lh "$APK_PATH"
+
+      # ---------- 上传产物 ----------
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-android
+          path: ${{ steps.find-apk.outputs.apk_path }}
+          retention-days: 30
+
+      - name: 上传 uni-app 资源包 (供 iOS job 使用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: uniapp-resources
+          path: dist/build/app/
+          retention-days: 1
+
+
+  # ============================
+  # Job 2: 构建 iOS IPA (未签名)
+  # ============================
+  build-ios:
+    name: Build iOS IPA (Unsigned)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+
+      # ---------- Node.js & uni-app 构建 ----------
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 缓存 npm 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: 安装项目依赖
+        run: npm install --legacy-peer-deps
+
+      - name: 构建 uni-app (app-plus 平台)
+        run: npm run build:app
+
+      # ---------- 下载 iOS 离线 SDK ----------
+      - name: 缓存 iOS 离线 SDK
+        id: cache-ios-sdk
+        uses: actions/cache@v4
+        with:
+          path: ios-sdk
+          key: ios-offline-sdk-${{ env.SDK_VERSION }}
+
+      - name: 下载 iOS 离线 SDK
+        if: steps.cache-ios-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ios-sdk
+          curl -L -o ios-sdk.zip "${{ env.IOS_SDK_URL }}"
+          unzip -q ios-sdk.zip -d ios-sdk
+          rm ios-sdk.zip
+          echo "iOS SDK 目录结构:"
+          find ios-sdk -maxdepth 3 -type d | head -30
+
+      # ---------- 集成资源到 SDK ----------
+      - name: 复制 uni-app 资源到 iOS SDK
+        run: |
+          APPID="${{ env.APPID }}"
+
+          # iOS SDK 中的资源目录
+          WWW_DIR="ios-sdk/SDK/HBuilder-Hello/Pandora/apps/$APPID/www"
+
+          # 创建目录
+          mkdir -p "$WWW_DIR"
+
+          # 复制构建产物
+          if [ -d "dist/build/app/www" ]; then
+            cp -r dist/build/app/www/* "$WWW_DIR/"
+          else
+            cp -r dist/build/app/* "$WWW_DIR/"
+          fi
+
+          echo "=== iOS SDK 资源目录 ==="
+          find "$WWW_DIR" -maxdepth 3 -type d | head -20
+
+      - name: 配置 iOS 项目
+        run: |
+          APPID="${{ env.APPID }}"
+
+          # 配置 control.xml
+          CTRL_XML="ios-sdk/SDK/HBuilder-Hello/Pandora/apps/$APPID/www/control.xml"
+          mkdir -p "$(dirname "$CTRL_XML")"
+          cat > "$CTRL_XML" << 'XMLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <hbuilder>
+            <apps>
+              <app appid="APPID_PLACEHOLDER" appver="${{ env.VERSION_NAME }}"/>
+            </apps>
+          </hbuilder>
+          XMLEOF
+          sed -i '' "s/APPID_PLACEHOLDER/$APPID/g" "$CTRL_XML"
+
+          echo "=== control.xml ==="
+          cat "$CTRL_XML"
+
+      # ---------- Xcode 编译 ----------
+      - name: 列出可用的 Xcode 版本
+        run: |
+          xcodebuild -version
+          ls /Applications/Xcode*.app/Contents/Developer/
+
+      - name: 编译 iOS (未签名)
+        working-directory: ios-sdk/SDK/HBuilder-Hello
+        run: |
+          # 查找 .xcodeproj 或 .xcworkspace
+          if [ -f "HBuilder-Hello.xcworkspace" ]; then
+            WORKSPACE="HBuilder-Hello.xcworkspace"
+            SCHEME="HBuilder-Hello"
+          elif [ -f "HBuilder-Hello.xcodeproj/project.pbxproj" ]; then
+            WORKSPACE="HBuilder-Hello.xcodeproj"
+            SCHEME="HBuilder-Hello"
+          else
+            echo "查找 Xcode 项目文件..."
+            XCPROJ=$(find . -name "*.xcodeproj" -maxdepth 2 | head -1)
+            XCWS=$(find . -name "*.xcworkspace" -maxdepth 2 | head -1)
+            if [ -n "$XCWS" ]; then
+              WORKSPACE="$XCWS"
+            else
+              WORKSPACE="$XCPROJ"
+            fi
+            SCHEME="HBuilder-Hello"
+          fi
+
+          echo "使用: WORKSPACE=$WORKSPACE SCHEME=$SCHEME"
+
+          # 编译 (不签名)
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            | tee xcodebuild.log
+
+      - name: 打包 IPA
+        run: |
+          # 查找 .app
+          APP_PATH=$(find ios-sdk/SDK/HBuilder-Hello/build -name "*.app" -type d | head -1)
+          echo "App 路径: $APP_PATH"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "⚠️ 未找到 .app 文件, 检查构建日志"
+            grep -i "error" ios-sdk/SDK/HBuilder-Hello/xcodebuild.log || true
+            echo "尝试查找所有产物..."
+            find ios-sdk/SDK -name "*.app" -type d 2>/dev/null || echo "未找到 .app"
+            exit 1
+          fi
+
+          # 创建 Payload 目录并打包 IPA
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r app-unsigned.ipa Payload/
+          rm -rf Payload
+
+          echo "=== IPA 已生成 ==="
+          ls -lh app-unsigned.ipa
+
+          echo "ipa_path=app-unsigned.ipa" >> $GITHUB_OUTPUT
+        id: pack-ipa
+
+      # ---------- 上传产物 ----------
+      - name: 上传 IPA 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-unsigned-ios
+          path: app-unsigned.ipa
+          retention-days: 30
+
+
+  # ============================
+  # Job 3: 汇总结果
+  # ============================
+  summary:
+    name: 打包结果汇总
+    needs: [build-android, build-ios]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: 汇总
+        run: |
+          echo "========================================"
+          echo "  uni-app GitHub Actions 打包完成"
+          echo "========================================"
+          echo ""
+          echo "产物下载位置: 本页面底部 Artifacts 区域"
+          echo ""
+          echo "  📱 Android APK → app-debug-android.zip"
+          echo "     (debug 签名, 可直接安装测试)"
+          echo ""
+          echo "  📱 iOS IPA → app-unsigned-ios.zip"
+          echo "     (未签名, 需重签后才能安装到真机)"
+          echo "     (可配合 ios-app-signer / AltStore 使用)"
+          echo ""
+          echo "⚠️  注意事项:"
+          echo "  1. APK 使用 debug.keystore 签名, 仅供测试"
+          echo "  2. IPA 未签名, 无法直接安装到非越狱设备"
+          echo "  3. 如需正式发布, 请替换为你的签名证书"
+          echo "========================================"
