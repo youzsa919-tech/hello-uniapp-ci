@@ -59,6 +59,9 @@ jobs:
       - name: 安装项目依赖
         run: npm install --legacy-peer-deps
 
+      - name: 安装 uni-uts-v1 (编译器运行时依赖)
+        run: npm install @dcloudio/uni-uts-v1@3.0.0-alpha-5020120260710001 --legacy-peer-deps
+
       - name: 构建 uni-app (app-plus 平台)
         run: npm run build:app
 
